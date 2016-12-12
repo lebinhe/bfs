@@ -16,13 +16,19 @@ std::string g_bfs_path;
 std::string g_bfs_cluster;
 
 #define BFS "\e[0;32m[BFS]\e[0m "
+#define BFSERR "\e[0;31m[BFS]\e[0m "
+
+const int g_max_random_write_size = 256 * 1024 * 1024;
 
 struct MountFile {
     baidu::bfs::File* bfs_file;
     int64_t offset;
     char* buf;
     int32_t buf_len;
-    MountFile(baidu::bfs::File* bfile) : bfs_file(bfile), offset(0), buf(NULL), buf_len(0) {}
+    int64_t file_size;
+    MountFile(baidu::bfs::File* bfile)
+        : bfs_file(bfile), offset(0),
+          buf(NULL), buf_len(0), file_size(0) {}
 };
 
 baidu::bfs::File* get_bfs_file(const struct fuse_file_info* finfo, MountFile** mount_file = NULL) {
@@ -146,12 +152,43 @@ int bfs_truncate(const char* name, off_t offset) {
     return EPERM;
 }
 
-void prepare_write_buf(MountFile* mfile, baidu::bfs::File* file = NULL) {
-    const int init_write_buf_size = 4096;
-    mfile->buf = new char[init_write_buf_size];
-    memset(mfile->buf, 0, init_write_buf_size);
-    mfile->buf_len = init_write_buf_size;
+bool reopen_for_write(MountFile* mfile, bool sync) {
+    baidu::bfs::File* bfs_file = mfile->bfs_file;
+    if (sync) {
+        int ret = bfs_file->Sync();
+        if (ret != 0) {
+            fprintf(stderr, BFSERR"Sync for random write fail: %s\n",
+                    baidu::bfs::StrError(ret));
+            return false;
+        }
+    }
+    int64_t fsize = bfs_file->Seek(0, SEEK_END);
+    if (fsize < 0) {
+        fprintf(stderr, BFSERR"GetFileSize for random write fail: %ld %s\n",
+                fsize, baidu::bfs::StrError(fsize));
+        return false;
+    } else if (fsize > g_max_random_write_size) {
+        fprintf(stderr, BFSERR"File too large for random write: %ld\n", fsize);
+        return false;
+    }
+    mfile->file_size = fsize;
+    // Read file to memory, then create a new file for writting.
+    mfile->buf_len = std::max(mfile->file_size, 4096L);
+    mfile->buf = new char[mfile->buf_len];
+
+    if (bfs_file && mfile->file_size > 0) {
+        int64_t ret = bfs_file->Read(mfile->buf, mfile->file_size);
+        if (ret < mfile->file_size) {
+            fprintf(stderr, BFSERR"Read for random write fail\n");
+            return false;
+        }
+    }
+    bfs_file->Close();
+    delete bfs_file;
+    mfile->bfs_file = NULL;
+    return true;
 }
+
 int bfs_open(const char* path, struct fuse_file_info* finfo) {
     fprintf(stderr, BFS"open(%s, %o)\n", path, finfo->flags);
     baidu::bfs::File* file = NULL;
@@ -164,8 +201,8 @@ int bfs_open(const char* path, struct fuse_file_info* finfo) {
     }
     fprintf(stderr, BFS"open(%s) return %p\n", path, file);
     MountFile* mfile = new MountFile(file);
-    if (finfo->flags & O_RDWR) {
-        prepare_write_buf(mfile, file);
+    if (finfo->flags & O_RDWR || finfo->flags & O_WRONLY) {
+        reopen_for_write(mfile, false);
     }
     finfo->fh = reinterpret_cast<uint64_t>(mfile);
     return 0;
@@ -173,53 +210,70 @@ int bfs_open(const char* path, struct fuse_file_info* finfo) {
 
 int bfs_read(const char* path, char* buf, size_t len, off_t offset, struct fuse_file_info* finfo) {
     fprintf(stderr, BFS"read(%s, %ld, %lu)\n", path, offset, len);
-    baidu::bfs::File* file = get_bfs_file(finfo);
-    int ret = file->Pread(buf, len, offset, true);
+    MountFile* mfile = NULL;
+    baidu::bfs::File* file = get_bfs_file(finfo, &mfile);
+    int ret = 0;
+    if (mfile->buf) {
+        // Read from memory.
+        if(offset < mfile->file_size) {
+            ret = std::min(static_cast<int64_t>(len), mfile->file_size - offset);
+            memcpy(buf, mfile->buf + offset, ret);
+        }
+    } else {
+        // Read from dfs.
+        ret = file->Pread(buf, len, offset, true);
+    }
     fprintf(stderr, BFS"read(%s, %ld, %lu) return %d\n", path, offset, len, ret);
     if (ret < 0) {
-        ret = EACCES;
+        ret = -EIO;
     }
     return ret;
 }
 
-int bfs_write(const char* path, const char* buf, size_t len, off_t offset, struct fuse_file_info* finfo) {
+int bfs_random_write(MountFile* mfile, const char* path, const char* buf,
+                     size_t len, off_t offset) {
+    fprintf(stderr, BFS"random write(%s, %ld, %lu) old offset= %ld\n",
+            path, offset, len, mfile->offset);
+    int64_t end_offset = offset + len;
+    if (end_offset > g_max_random_write_size) {
+        fprintf(stderr, BFSERR"File too large for random write: %ld\n", end_offset);
+        return -EIO;
+    }
+    int new_buf_len = std::min(static_cast<int64_t>(g_max_random_write_size),
+                               std::max(mfile->offset, end_offset * 2));
+    if (mfile->buf_len < end_offset) {
+        char* new_buf = new char[new_buf_len];
+        memcpy(new_buf, mfile->buf, mfile->buf_len);
+        delete[] mfile->buf;
+        mfile->buf = new_buf;
+        mfile->buf_len = new_buf_len;
+    }
+    memcpy(mfile->buf + offset, buf, len);
+    return len;
+}
+
+int bfs_write(const char* path, const char* buf, size_t len,
+              off_t offset, struct fuse_file_info* finfo) {
     const int zero_buf_size = 256 * 1024;
-    const int max_random_write_size = 256 * 1024 * 1024;
     static char zero_buf[zero_buf_size] = {0};
     fprintf(stderr, BFS"write(%s, %ld, %lu)\n", path, offset, len);
     MountFile* mfile = NULL;
     baidu::bfs::File* file = get_bfs_file(finfo, &mfile);
-    if (mfile->buf || mfile->offset > offset) {
-        fprintf(stderr, BFS"random write(%s, %ld, %lu) old offset= %ld\n", path, offset, len, mfile->offset);
-        int64_t end_offset = offset + len;
-        if (end_offset > max_random_write_size || mfile->offset > max_random_write_size) {
-            return EACCES;
+    // The first random write ops.
+    if (!mfile->buf && mfile->offset > offset) {
+        if(!reopen_for_write(mfile, true)) {
+            return -EIO;
         }
-        int new_buf_len = std::min(static_cast<int64_t>(max_random_write_size), std::max(mfile->offset, end_offset * 2));
-        if (mfile->buf == NULL) {
-            mfile->buf = new char[new_buf_len];
-            mfile->buf_len = new_buf_len;
-            int rlen = file->Pread(mfile->buf, mfile->offset, 0);
-            if (rlen != 0 && rlen < mfile->offset) {
-                fprintf(stderr, BFS"Read(%ld) for randmon write(%s, %ld, %lu) fail", mfile->offset, path, offset, len);
-                delete[] mfile->buf;
-                mfile->buf = NULL;
-                mfile->buf_len = 0;
-                return EACCES;
-            }
-        } else if (mfile->buf_len < end_offset) {
-            char* new_buf = new char[new_buf_len];
-            memcpy(new_buf, mfile->buf, mfile->buf_len);
-            delete[] mfile->buf;
-            mfile->buf = new_buf;
-            mfile->buf_len = new_buf_len;
-        }
-        memcpy(mfile->buf + offset, buf, len);
-        return len;
-    } else if (mfile->offset < offset) {
-        if (mfile)
+    }
+    // Randon write.
+    if (mfile->buf) {
+        return bfs_random_write(mfile, path, buf, len, offset);
+    }
+
+    if (mfile->offset < offset) {
         // Padding if skip
-        fprintf(stderr, BFS"Write(%s, %ld, %lu) padding from %ld\n", path, offset, len, mfile->offset);
+        fprintf(stderr, BFS"Write(%s, %ld, %lu) padding from %ld\n",
+                path, offset, len, mfile->offset);
         while (mfile->offset < offset) {
             int blen = std::min(static_cast<int64_t>(zero_buf_size), offset - mfile->offset);
             int wlen = file->Write(zero_buf, blen);
@@ -229,7 +283,7 @@ int bfs_write(const char* path, const char* buf, size_t len, off_t offset, struc
             if (wlen < blen) {
                 fprintf(stderr, BFS"Write(%s, %ld, %lu) padding at %ld fail w:%d b:%d\n",
                         path, offset, len, mfile->offset, wlen, blen);
-                return EACCES;
+                return -EACCES;
             }
         }
     }
@@ -239,7 +293,7 @@ int bfs_write(const char* path, const char* buf, size_t len, off_t offset, struc
     }
     fprintf(stderr, BFS"write(%s, %ld, %lu) return %d\n", path, offset, len, ret);
     if (ret < 0) {
-        ret = EACCES;
+        ret = -EACCES;
     }
     return ret;
 }
@@ -252,13 +306,14 @@ int bfs_statfs(const char* path, struct statvfs*) {
 int bfs_flush(const char* path, struct fuse_file_info* finfo) {
     baidu::bfs::File* file = get_bfs_file(finfo);
     fprintf(stderr, BFS"flush(%s, %p)\n", path, file);
+    /*
     int32_t ret = file->Flush();
     if (ret != OK) {
         fprintf(stderr, BFS"flush(%s, %p) fail, error code %s\n",
                 path, file, baidu::bfs::StrError(ret));
         return EIO;
     }
-    fprintf(stderr, BFS"flush(%s, %p) return 0\n", path, file);
+    fprintf(stderr, BFS"flush(%s, %p) return 0\n", path, file);*/
     return 0;
 }
 
@@ -396,8 +451,11 @@ int bfs_create(const char* path, mode_t mode, struct fuse_file_info* finfo) {
     return 0;
 }
 
-int bfs_ftruncate(const char* path, off_t offset, struct fuse_file_info*) {
+int bfs_ftruncate(const char* path, off_t offset, struct fuse_file_info* finfo) {
     fprintf(stderr, BFS"ftruncate(%s, %ld)\n", path, offset);
+    MountFile* mfile = NULL;
+    get_bfs_file(finfo, &mfile);
+    mfile->file_size = offset;
     return 0;
 }
 
